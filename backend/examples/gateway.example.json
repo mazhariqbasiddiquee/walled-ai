@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "demo": {
+      "command": "/Users/mazhariqbal/.mcp-guard/runtime/bin/python",
+      "args": ["/Users/mazhariqbal/.mcp-guard/runtime/demo_server.py"]
+    },
+    "filesystem": {
+      "command": "/opt/homebrew/bin/npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/mazhariqbal/Documents"]
+    }
+  }
+}
