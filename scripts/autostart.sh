@@ -18,10 +18,12 @@ APP_SRC="$PROJECT/desktop/dist/mac-arm64/MCP Guard.app"
 APP_DST="/Applications/MCP Guard.app"
 UID_DOMAIN="gui/$(id -u)"
 LABELS=(com.mcpguard.daemon com.mcpguard.gateway com.mcpguard.ngrok)
-PATH_ENV="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+PATH_ENV="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
-port_owner() { lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print $1" (pid "$2")"}'; }
+port_owner() { # prints "name (pid N)" if something listens on the port; lsof fails when nothing does
+  { lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null || true; } | awk 'NR==2 {print $1" (pid "$2")"}'
+}
 
 write_plist() { # label, then program arguments
   local label="$1"; shift
@@ -126,7 +128,8 @@ status() {
   for l in "${LABELS[@]}"; do
     if [[ -f "$AGENTS/$l.plist" ]]; then
       pid="$(launchctl print "$UID_DOMAIN/$l" 2>/dev/null | awk '/^\tpid =/ {print $3}')"
-      printf '  %-22s %s\n' "$l" "${pid:+running (pid $pid)}${pid:-NOT running, see $LOGS/${l#com.mcpguard.}.log}"
+      if [[ -n "$pid" ]]; then state="running (pid $pid)"; else state="NOT running, see $LOGS/${l#com.mcpguard.}.log"; fi
+      printf '  %-22s %s\n' "$l" "$state"
     else
       printf '  %-22s %s\n' "$l" "not installed"
     fi

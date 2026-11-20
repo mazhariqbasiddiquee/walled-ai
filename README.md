@@ -27,61 +27,78 @@ It puts a checkpoint between Claude and every MCP server:
 
 ## 3. Architecture
 
+Claude Desktop and Claude on the web (claude.ai) use **the same path**: both talk
+to one **gateway** URL, and the gateway is the only thing that starts and talks to
+the real MCP servers.
+
 ```
-┌────────────────┐  tool call   ┌────────────────┐  only if allowed   ┌─────────────────┐
-│ Claude Desktop │ ───────────▶ │  MCP Guard     │ ─────────────────▶ │ Real MCP server │
-│                │ ◀─────────── │  Proxy         │ ◀───────────────── │ (filesystem…)   │
-└────────────────┘    result    └───────┬────────┘       result       └─────────────────┘
-                                        │ "may I run this?"
-                                        ▼
-                               ┌────────────────────┐   WebSocket + REST   ┌──────────────────┐
-                               │  MCP Guard Daemon  │ ◀──────────────────▶ │  Desktop App     │
-                               │  127.0.0.1:8765    │                      │  (Electron)      │
-                               │  • Policy rules    │                      │  • Approval popup│
-                               │  • Approval queue  │                      │  • History       │
-                               │  • Audit log (DB)  │                      │  • Rules/Settings│
-                               └────────────────────┘                      └──────────────────┘
-                                                                                  ▲
-                                                                                  │ Allow / Block
-                                                                                 You
+Claude Desktop ──stdio──▶ mcp-remote ──HTTP (local)──┐
+                                                     ▼
+claude.ai ──HTTPS──▶ ngrok (public URL) ─────▶ ┌──────────────────────┐  only if allowed  ┌─────────────────┐
+                                               │  MCP Guard Gateway   │ ────────────────▶ │ Real MCP servers│
+                                               │  127.0.0.1:8766/mcp  │ ◀──────────────── │ demo, filesystem│
+                                               └──────────┬───────────┘      result       └─────────────────┘
+                                                          │ "may I run this?"
+                                                          ▼
+                                               ┌──────────────────────┐  WebSocket + REST  ┌──────────────────┐
+                                               │  MCP Guard Daemon    │ ◀────────────────▶ │  Desktop App     │
+                                               │  127.0.0.1:8765      │                    │  (Electron)      │
+                                               │  • Policy rules      │                    │  • Approval popup│
+                                               │  • Approval queue    │                    │  • History       │
+                                               │  • Audit log (DB)    │                    │  • Rules/Settings│
+                                               └──────────────────────┘                    └──────────────────┘
+                                                                                                   ▲
+                                                                                                   │ Allow / Block
+                                                                                                  You
 ```
 
 There are **three programs**:
 
 | Program | What it is | Who starts it |
 |---|---|---|
-| **Proxy** (`mcp-guard proxy`) | Stands in for each real MCP server. Claude thinks it *is* the server. | Claude Desktop, automatically |
-| **Daemon** (`mcp-guard daemon`) | The decision-maker: rules, pending queue, audit log, API | You, in a terminal |
-| **Desktop app** (Electron) | The user interface: popup, history, rules, settings | You (`npm run dev`) |
+| **Gateway** (`mcp-guard gateway`) | One MCP endpoint (`/mcp`) in front of all your real MCP servers. Every tool call is held until the daemon says yes. | Auto-start service, or you in a terminal |
+| **Daemon** (`mcp-guard daemon`) | The decision-maker: rules, pending queue, audit log, API | Auto-start service, or you in a terminal |
+| **Desktop app** (Electron) | The user interface: popup, history, rules, settings | Login item, or you (`npm run dev`) |
 
-### Why split it this way?
+Two small helpers connect Claude to the gateway:
 
-- **Proxy per server:** Claude Desktop launches every MCP server as its own
-  process. Wrapping each one is the least intrusive change: you prefix the
-  server's command in Claude's config and nothing else changes.
-- **One daemon:** many proxies (and many simultaneous calls) need one shared
-  place for decisions, rules and the log, and the UI needs one place to connect to.
+- **Claude Desktop → `mcp-remote`** (an npm package). Claude Desktop's config only
+  starts local programs, so it starts `mcp-remote`, which forwards to
+  `http://127.0.0.1:8766/mcp`. This stays on your Mac; no internet needed.
+- **claude.ai → ngrok.** claude.ai runs in Anthropic's cloud, so it needs a public
+  HTTPS URL. ngrok forwards that URL to the gateway (see 7b).
+
+### Why it's built this way
+
+- **One gateway for both Claudes:** the list of protected servers lives in one
+  file (`~/.mcp-guard/gateway.json`). Add a server there and it shows up, guarded,
+  in Desktop and on the web.
+- **One daemon:** many simultaneous calls need one shared place for decisions,
+  rules and the log, and the UI needs one place to connect to.
 - **UI separate from the daemon:** the security logic keeps working without the UI
   (you can approve from the terminal), and the UI can be restarted or rebuilt
   without touching the protection.
+- **Daemon never exposed:** only the gateway (port 8766) is ever tunnelled. The
+  daemon (port 8765), which can approve requests, stays on `127.0.0.1`.
 
 ## 4. The life of one tool call
 
-Example: you ask Claude *"Save my notes to ~/Documents/notes.txt"*.
+Example: you ask Claude *"Save my notes to ~/Documents/notes.txt"*. Tool names
+in Claude carry the server as a prefix: `filesystem__write_file`.
 
 | # | What happens | Where |
 |---|---|---|
 | 1 | Claude decides to call `write_file` on the `filesystem` server | Claude |
 | 2 | Claude shows its own "Allow once?" prompt (Claude's own check, not ours) | Claude |
-| 3 | Claude sends the call to what it thinks is the filesystem server, which is really our **proxy** | Claude → Proxy |
-| 4 | Proxy sends `{server, tool, arguments}` to the daemon (`POST /api/requests`) | Proxy → Daemon |
+| 3 | Claude sends `filesystem__write_file` to the **gateway** (Desktop via `mcp-remote`, web via ngrok) | Claude → Gateway |
+| 4 | Gateway sends `{server, tool, arguments}` to the daemon (`POST /api/requests`) | Gateway → Daemon |
 | 5 | Daemon checks the **rules**. A match → instant allow/block (skip to 9). No match → **PENDING** | Daemon |
 | 6 | Daemon pushes `request.created` over WebSocket | Daemon → App |
 | 7 | **Popup appears** with server, tool, risk hint and parameters, plus a countdown | App |
 | 8 | You click **Allow** (or Block, or press Esc). The app sends the decision (`POST /api/requests/{id}/decision`) | You → App → Daemon |
-| 9 | The proxy, which was waiting (`GET /api/requests/{id}/wait`), receives the decision | Daemon → Proxy |
-| 10a | **Approved:** the proxy forwards the call to the real server, gets the result, reports it to the daemon (`POST .../result`) and returns it to Claude | Proxy ↔ Server |
-| 10b | **Blocked / expired:** the real server is never contacted. Claude gets *"Tool call was not executed: REJECTED"* | Proxy → Claude |
+| 9 | The gateway, which was waiting (`GET /api/requests/{id}/wait`), receives the decision | Daemon → Gateway |
+| 10a | **Approved:** the gateway forwards the call to the real server, gets the result, reports it to the daemon (`POST .../result`) and returns it to Claude | Gateway ↔ Server |
+| 10b | **Blocked / expired:** the real server is never contacted. Claude gets *"Tool call was not executed: REJECTED"* | Gateway → Claude |
 | 11 | Everything is saved in the audit log | Daemon |
 
 ### Request states
@@ -100,21 +117,23 @@ once without interfering with each other.
 
 | Situation | Result |
 |---|---|
-| Daemon not running | Proxy blocks every call |
+| Daemon not running | Gateway blocks every call |
+| Gateway not running | Claude can't reach any protected tool (nothing runs unguarded) |
 | No answer before the timeout | Request expires → blocked |
 | Desktop app closed | Requests still wait; approve from the terminal (`mcp-guard watch`) or they expire |
-| Token missing or wrong | API refuses the call |
+| Token or gateway key missing or wrong | Request refused |
 
 ## 5. Project structure
 
 ```
-Project/
+walled-ai/
 ├── README.md                ← this file
-├── .venv/                   ← Python environment (development)
-├── backend/                 ← Python: proxy + daemon
+├── .venv/                   ← Python environment (create it; not in git)
+├── scripts/autostart.sh     ← install/uninstall LaunchAgents + app (see 7c)
+├── backend/                 ← Python: gateway + daemon
 │   ├── mcp_guard/
-│   │   ├── proxy.py         ← MCP proxy for Claude Desktop (stdio)
-│   │   ├── gateway.py       ← MCP gateway for claude.ai (HTTP, one URL for all servers)
+│   │   ├── gateway.py       ← MCP gateway: one HTTP URL for all servers (Desktop + web)
+│   │   ├── proxy.py         ← shared approval logic + optional per-server stdio proxy
 │   │   ├── api.py           ← daemon HTTP + WebSocket API (FastAPI)
 │   │   ├── approvals.py     ← approval manager: per-request lifecycle and timeouts
 │   │   ├── policy.py        ← rules engine (allow / block / ask, glob patterns)
@@ -123,7 +142,9 @@ Project/
 │   │   ├── models.py        ← data models
 │   │   ├── config.py        ← settings, paths, token
 │   │   └── cli.py           ← `mcp-guard` command
-│   ├── examples/demo_server.py   ← harmless test MCP server (echo, write_note)
+│   ├── examples/
+│   │   ├── demo_server.py         ← harmless test MCP server (echo, write_note)
+│   │   └── gateway.example.json   ← server list for `mcp-guard gateway`
 │   └── tests/               ← 14 automated tests
 └── desktop/                 ← Electron + React + TypeScript + Tailwind
     └── src/
@@ -139,79 +160,147 @@ Files MCP Guard creates in your home folder (`~/.mcp-guard/`):
 |---|---|
 | `config.json` | Port, approval timeout, default action |
 | `token` | Secret shared by the daemon, proxies and app (readable only by you) |
+| `gateway_key` | Secret Claude Desktop and claude.ai send to the gateway |
+| `gateway.json` | The MCP servers the gateway protects (see 6.3) |
 | `audit.db` | SQLite database: every request plus your rules |
-| `runtime/` | A copy of MCP Guard that Claude Desktop runs (see 6.2) |
+| `runtime/` | The installed copy the background services run (see 6.2) |
+| `logs/` | Service logs, created by `scripts/autostart.sh` (see 7c) |
+
+Set `MCP_GUARD_HOME` to use a different folder (see 6.0).
 
 ## 6. Setup (one time)
+
+**Requirements:** macOS (the auto-start script and paths assume it), Python 3.11+,
+Node.js + npm, Claude Desktop, and optionally [ngrok](https://ngrok.com) for claude.ai.
+
+### 6.0 Paths: set them once
+
+Every command in this guide uses these variables instead of hard-coded folders.
+If you move or rename the repo, change **one line** (`MCP_GUARD_REPO`) and
+everything else follows.
+
+```bash
+export MCP_GUARD_REPO="$HOME/Desktop/walled-ai"      # where this repo lives: edit if you move it
+export MCP_GUARD_HOME="$HOME/.mcp-guard"             # MCP Guard's data folder (the default)
+export MCP_GUARD_RUNTIME="$MCP_GUARD_HOME/runtime"   # the copy the services run (see 6.2)
+```
+
+To keep them in every new terminal, add the same three lines to `~/.zshrc` and
+run `source ~/.zshrc`. Check them with:
+
+```bash
+echo "$MCP_GUARD_REPO" "$MCP_GUARD_RUNTIME" && ls "$MCP_GUARD_REPO/backend"
+```
+
+| Variable | Default | Used for |
+|---|---|---|
+| `MCP_GUARD_REPO` | `~/Desktop/walled-ai` | Source code: `backend/`, `desktop/`, `scripts/` |
+| `MCP_GUARD_HOME` | `~/.mcp-guard` | Token, audit DB, config, logs. MCP Guard itself reads this variable. |
+| `MCP_GUARD_RUNTIME` | `~/.mcp-guard/runtime` | The installed copy that the background services run |
+
+> `scripts/autostart.sh` always uses `~/.mcp-guard`, so keep `MCP_GUARD_HOME`
+> at its default if you use auto-start (7c).
 
 ### 6.1 Backend
 
 ```bash
-cd /Users/mazhariqbal/Desktop/Project
+cd "$MCP_GUARD_REPO"
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e "backend[dev]"
 cd backend && pytest          # 14 tests should pass
 ```
 
-### 6.2 Runtime copy for Claude Desktop
+### 6.2 Runtime copy
 
-macOS doesn't let apps read the **Desktop** folder without permission, so Claude
-can't run MCP Guard from `~/Desktop/Project`. Install a copy outside it:
-
-```bash
-python3 -m venv ~/.mcp-guard/runtime
-~/.mcp-guard/runtime/bin/pip install /Users/mazhariqbal/Desktop/Project/backend
-cp /Users/mazhariqbal/Desktop/Project/backend/examples/demo_server.py ~/.mcp-guard/runtime/
-```
-
-After changing backend code, refresh this copy and restart Claude:
+macOS doesn't let background programs read the **Desktop** folder without
+permission, so the services can't run MCP Guard from a repo under `~/Desktop`.
+Install a copy outside it (`scripts/autostart.sh install` also does this for you):
 
 ```bash
-~/.mcp-guard/runtime/bin/pip install --force-reinstall --no-deps /Users/mazhariqbal/Desktop/Project/backend
+python3 -m venv "$MCP_GUARD_RUNTIME"
+"$MCP_GUARD_RUNTIME/bin/pip" install "$MCP_GUARD_REPO/backend"
+cp "$MCP_GUARD_REPO/backend/examples/demo_server.py" "$MCP_GUARD_RUNTIME/"
 ```
 
-### 6.3 Connect Claude Desktop
-
-Quit Claude (**Cmd+Q**), open its config:
+After changing backend code, refresh it (or re-run `scripts/autostart.sh install`):
 
 ```bash
-open -e ~/Library/Application\ Support/Claude/claude_desktop_config.json
+"$MCP_GUARD_RUNTIME/bin/pip" install --force-reinstall --no-deps "$MCP_GUARD_REPO/backend"
 ```
 
-Add (or keep) an `mcpServers` section next to the existing `preferences`:
+### 6.3 Choose the servers to protect (`gateway.json`)
 
-```json
-"mcpServers": {
-  "demo": {
-    "command": "/Users/mazhariqbal/.mcp-guard/runtime/bin/mcp-guard",
-    "args": ["proxy", "--name", "demo", "--",
-             "/Users/mazhariqbal/.mcp-guard/runtime/bin/python",
-             "/Users/mazhariqbal/.mcp-guard/runtime/demo_server.py"]
-  },
-  "filesystem": {
-    "command": "/Users/mazhariqbal/.mcp-guard/runtime/bin/mcp-guard",
-    "args": ["proxy", "--name", "filesystem", "--",
-             "/opt/homebrew/bin/npx", "-y", "@modelcontextprotocol/server-filesystem",
-             "/Users/mazhariqbal/Documents"]
+This one file is the list of MCP servers, for Desktop **and** web. It uses Claude
+Desktop's `mcpServers` format. Create it with your paths filled in (once):
+
+```bash
+cat > "$MCP_GUARD_HOME/gateway.json" <<EOF
+{
+  "mcpServers": {
+    "demo": {
+      "command": "$MCP_GUARD_RUNTIME/bin/python",
+      "args": ["$MCP_GUARD_RUNTIME/demo_server.py"]
+    },
+    "filesystem": {
+      "command": "$(which npx)",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "$HOME/Documents"]
+    }
   }
 }
+EOF
 ```
 
-**To protect any MCP server:** keep its original command, put it after `--`, and
-put `mcp-guard proxy --name <name>` in front. Always use full paths, because Claude
-doesn't use your terminal's PATH.
+**To protect another MCP server:** add its entry here, exactly as you would have
+put it in Claude Desktop's config (full paths, since services don't use your
+terminal's PATH), then restart the gateway (`scripts/autostart.sh install`, or
+Ctrl+C and start it again). Its tools appear in both Claudes as `<server>__<tool>`.
 
-Check the file is valid JSON, then reopen Claude:
+### 6.4 Connect Claude Desktop
+
+Claude Desktop starts `mcp-remote`, which connects to the local gateway with the
+gateway key. Quit Claude (**Cmd+Q**), back up its config, then put a single
+`mcp-guard` entry in `mcpServers` (keep `preferences` and any other keys).
+This prints the entry with your real paths and key filled in:
 
 ```bash
-python3 -m json.tool ~/Library/Application\ Support/Claude/claude_desktop_config.json > /dev/null && echo OK
+CFG=~/Library/Application\ Support/Claude/claude_desktop_config.json
+cp "$CFG" "$CFG.backup"
+cat <<EOF
+"mcpServers": {
+  "mcp-guard": {
+    "command": "$(which npx)",
+    "args": ["-y", "mcp-remote@0.16.7", "http://127.0.0.1:8766/mcp",
+             "--header", "X-Auth-Token:\${MCP_GUARD_KEY}"],
+    "env": {
+      "MCP_GUARD_KEY": "$("$MCP_GUARD_RUNTIME/bin/mcp-guard" gateway-key)",
+      "PATH": "$(dirname "$(which npx)"):/usr/local/bin:/usr/bin:/bin"
+    }
+  }
+}
+EOF
+open -e "$CFG"
 ```
 
-### 6.4 Desktop app
+Paste it in place of the old `mcpServers`, save, check the JSON, and reopen Claude:
 
 ```bash
-cd /Users/mazhariqbal/Desktop/Project/desktop
+python3 -m json.tool "$CFG" > /dev/null && echo OK
+```
+
+Notes:
+- `${MCP_GUARD_KEY}` is filled in by `mcp-remote` from `env`, so the key sits in
+  one place in the file. The config file is only readable by you.
+- `PATH` in `env` is needed because Claude doesn't use your terminal's PATH, and
+  `npx` needs to find `node`.
+- `mcp-remote` is pinned to a tested version. Bump it deliberately.
+- If you create a new gateway key, update `MCP_GUARD_KEY` here **and** the
+  claude.ai connector.
+
+### 6.5 Desktop app
+
+```bash
+cd "$MCP_GUARD_REPO/desktop"
 npm install
 ```
 
@@ -219,22 +308,32 @@ npm install
 
 **Terminal 1: daemon** (must always be running):
 ```bash
-cd /Users/mazhariqbal/Desktop/Project/backend
+cd "$MCP_GUARD_REPO/backend"
 source ../.venv/bin/activate
 mcp-guard daemon
 ```
 
-**Terminal 2: desktop app:**
+**Terminal 2: gateway** (Claude Desktop and claude.ai both connect to it):
 ```bash
-cd /Users/mazhariqbal/Desktop/Project/desktop
+cd "$MCP_GUARD_REPO/backend"
+source ../.venv/bin/activate
+mcp-guard gateway --config "$MCP_GUARD_HOME/gateway.json"
+```
+
+**Terminal 3: desktop app:**
+```bash
+cd "$MCP_GUARD_REPO/desktop"
 npm run dev
 ```
 
+Or skip the terminals and let them start at login: `scripts/autostart.sh install` (7c).
+
 Bottom-left of the app should say **Protected** (green).
 
-**Try it:** in Claude ask *"Use the demo echo tool to say hello"* → click
-**Allow once** in Claude → the MCP Guard popup appears → **Allow** → Claude says
-"hello". Ask it to use `write_note` and click **Block** to see a refusal.
+**Try it:** in Claude ask *"Use demo__echo to say hello"* → click **Allow once**
+in Claude → the MCP Guard popup appears → **Allow** → Claude says "hello". Ask it
+to use `demo__write_note` and click **Block** to see a refusal. The same works on
+claude.ai once 7b is set up.
 
 ### Without the app (terminal only)
 
@@ -260,54 +359,51 @@ Rules decide calls automatically. Server and tool are patterns (`*`, `?`); the
 
 Add rules on the **Rules** page, or tick **Remember** in the popup.
 
-## 7b. Claude on the web (claude.ai): the gateway
+## 7b. Claude on the web (claude.ai)
 
-claude.ai runs in Anthropic's cloud, so it can't *start* our proxy the way Claude
-Desktop does. It connects to a **URL** instead (a "custom connector"). The
-**gateway** is the proxy as an HTTP server: one URL serves all your MCP servers,
-and every call goes through the same daemon, rules, popup and audit log.
+claude.ai uses the **same gateway** as Claude Desktop, with the same servers,
+rules, popup and audit log. The only difference is how it reaches the gateway:
+claude.ai runs in Anthropic's cloud, so it needs a public HTTPS URL, which ngrok
+provides.
 
 ```
 claude.ai ──HTTPS──▶ ngrok (public URL) ──▶ mcp-guard gateway (127.0.0.1:8766/mcp)
-                                                 ├──▶ demo server
-                                                 ├──▶ filesystem server
-                                                 └──▶ daemon (stays private) ◀──▶ desktop app
 ```
 
-| | Desktop (stdio proxy) | Web (gateway) |
+| | Claude Desktop | claude.ai |
 |---|---|---|
-| Started by | Claude Desktop | You (`mcp-guard gateway`) |
-| Talks over | Pipe | HTTP at `/mcp`, made public by a tunnel |
-| Servers per URL | One proxy per server | All servers behind one URL |
-| Tool names in Claude | `echo` | `demo__echo` (server prefix) |
-| Protection | Private pipe | **Gateway key** required on every request |
+| Reaches the gateway via | `mcp-remote`, locally (`http://127.0.0.1:8766/mcp`) | ngrok tunnel (`https://….ngrok-free.dev/mcp`) |
+| Needs internet / ngrok | No | Yes |
+| Key sent as | `X-Auth-Token` header (set in Claude's config) | Header set in the connector |
+| Servers, tool names, rules, popup, audit log | Same | Same |
 
-**Run it** (4 terminals; the daemon and app as in section 7):
+**Expose the gateway** (gateway, daemon and app running as in section 7):
 
 ```bash
-# Terminal 3: gateway (server list in Claude Desktop format)
-cd /Users/mazhariqbal/Desktop/Project/backend && source ../.venv/bin/activate
-mcp-guard gateway --config examples/gateway.example.json
-
-# Terminal 4: public HTTPS URL for the gateway (only port 8766, never 8765)
+# public HTTPS URL for the gateway (only port 8766, never 8765)
 ngrok http 8766
 ```
 
+Or let it start at login with your fixed domain:
+`scripts/autostart.sh install --with-ngrok https://YOUR-DOMAIN.ngrok-free.dev` (7c).
+
 **Connect claude.ai:** Settings → Connectors → **Add custom connector**
 
-- **URL:** the `https://….ngrok-free.app` address from ngrok, plus `/mcp`
+- **URL:** your ngrok address plus `/mcp`, e.g. `https://YOUR-DOMAIN.ngrok-free.dev/mcp`
 - **Authentication:** *No sign-in*, then under **Request headers** pick the
   standard **Authorization** header with value `Bearer <key>`, where `<key>` is
-  the output of `mcp-guard gateway-key`. If the list offers **X-API-Key** instead,
-  use that with the bare key. (Custom header names need Anthropic's approval, so
-  don't type your own name.)
+  the output of `mcp-guard gateway-key`. **X-Auth-Token**, **X-API-Key**,
+  **X-API-Token** and **API-Key** also work: use them with the bare key, no
+  `Bearer`. (Custom header names need Anthropic's approval, so pick one from the
+  list rather than typing your own.)
 
 Then in a chat: *"Use demo__echo to say hello"* → popup → Allow.
 
 **Rules for the web setup:**
 
-- The **gateway key** (`~/.mcp-guard/gateway_key`) goes to claude.ai. The
-  **daemon token** (`~/.mcp-guard/token`) never leaves your Mac.
+- The **gateway key** (`~/.mcp-guard/gateway_key`) goes to claude.ai and into
+  Claude Desktop's config. The **daemon token** (`~/.mcp-guard/token`) never
+  leaves your Mac.
 - Only expose port **8766** (gateway). Never tunnel **8765** (daemon), or anyone
   could approve requests.
 - claude.ai stops waiting after **5 minutes**, so keep the approval timeout below that.
@@ -329,13 +425,14 @@ shared one gateway or you needed keys you can revoke per user.
 **Build the app** (creates `desktop/dist/mac-arm64/MCP Guard.app`, ad-hoc signed):
 
 ```bash
-cd desktop && npm run package
+cd "$MCP_GUARD_REPO/desktop" && npm run package
 ```
 
 **Install and auto-start everything** (stop any daemon/gateway/ngrok you started
 in terminals first, then quit the dev app):
 
 ```bash
+cd "$MCP_GUARD_REPO"
 scripts/autostart.sh install                                   # daemon + gateway + app
 scripts/autostart.sh install --with-ngrok https://YOUR-DOMAIN.ngrok-free.dev   # also expose for claude.ai
 scripts/autostart.sh status
@@ -345,7 +442,7 @@ scripts/autostart.sh uninstall
 | What | How it starts | Logs |
 |---|---|---|
 | Daemon | LaunchAgent `com.mcpguard.daemon` (restarts if it crashes) | `~/.mcp-guard/logs/daemon.log` |
-| Gateway | LaunchAgent `com.mcpguard.gateway`, config `~/.mcp-guard/gateway.json` | `~/.mcp-guard/logs/gateway.log` |
+| Gateway | LaunchAgent `com.mcpguard.gateway`, config `~/.mcp-guard/gateway.json` (Desktop + web) | `~/.mcp-guard/logs/gateway.log` |
 | ngrok (optional) | LaunchAgent `com.mcpguard.ngrok`, fixed URL | `~/.mcp-guard/logs/ngrok.log` |
 | Desktop app | `/Applications/MCP Guard.app`, login item (toggle "Open at login" in its menu-bar menu) | — |
 
@@ -357,7 +454,7 @@ run it again after changing backend code.
 
 | Situation | What to do |
 |---|---|
-| Changing code | Don't install. Run the daemon and `npm run dev` in terminals (section 7), plus the gateway and ngrok if you're testing claude.ai (7b). |
+| Changing code | Don't install. Run the daemon, gateway and `npm run dev` in terminals (section 7), plus ngrok if you're testing claude.ai (7b). |
 | Want MCP Guard always on | Build the app (`npm run package`), stop terminal processes, then run `scripts/autostart.sh install` once. It starts at every login. |
 | Changed backend code | Run `scripts/autostart.sh install` again to refresh the runtime copy. |
 | Back to working in terminals | Run `scripts/autostart.sh uninstall` first. The services hold ports 8765/8766. |
@@ -366,8 +463,8 @@ Don't run both ways at once: they need the same ports.
 
 **Why claude.ai isn't auto-started by default:** `--with-ngrok` is opt-in because
 an always-on tunnel makes the gateway reachable from the internet whenever you're
-logged in (protected only by the gateway key). Claude Desktop doesn't need it, so
-nothing is exposed unless you ask. It also needs your reserved ngrok domain: a
+logged in (protected only by the gateway key). Claude Desktop reaches the gateway
+locally and doesn't need it, so nothing is exposed unless you ask. It also needs your reserved ngrok domain: a
 plain `ngrok http 8766` gets a new URL on each restart, which would break the
 claude.ai connector after every login. And it needs ngrok installed and signed in.
 
@@ -384,11 +481,12 @@ Interactive docs: http://127.0.0.1:8765/docs
 
 | Method | Path | Used by | Purpose |
 |---|---|---|---|
-| POST | `/api/requests` | proxy | Submit a tool call |
-| GET | `/api/requests/{id}/wait` | proxy | Wait for the decision (long poll) |
-| POST | `/api/requests/{id}/cancel` | proxy | Claude gave up |
-| POST | `/api/requests/{id}/result` | proxy | Report execution result |
+| POST | `/api/requests` | gateway | Submit a tool call |
+| GET | `/api/requests/{id}/wait` | gateway | Wait for the decision (long poll) |
+| POST | `/api/requests/{id}/cancel` | gateway | Claude gave up |
+| POST | `/api/requests/{id}/result` | gateway | Report execution result |
 | GET | `/api/requests?status=&server=&limit=` | app | Pending list / history |
+| GET | `/api/requests/{id}` | app | One request |
 | POST | `/api/requests/{id}/decision` | app | `{"decision":"allow"\|"block","remember":bool}` |
 | GET | `/api/stats` | app | Counts per status |
 | GET/POST/DELETE | `/api/rules[/{id}]` | app | Manage rules |
@@ -411,21 +509,35 @@ Interactive docs: http://127.0.0.1:8765/docs
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `zsh: command not found: mcp-guard` | venv not activated | `source /Users/mazhariqbal/Desktop/Project/.venv/bin/activate` |
+| `zsh: command not found: mcp-guard` | venv not activated | `source "$MCP_GUARD_REPO/.venv/bin/activate"` |
 | App says **Daemon offline** | daemon not running | Start `mcp-guard daemon` |
 | Claude says tool was blocked "fail-closed" | daemon not running | Start the daemon |
 | Request shows **EXPIRED** | no answer in time | Answer faster, or raise the timeout in Settings |
-| demo/filesystem missing in Claude | Claude not fully restarted | **Cmd+Q**, reopen |
+| `demo__*` / `filesystem__*` tools missing in Claude Desktop | Claude not fully restarted, or gateway not running | **Cmd+Q** and reopen; `scripts/autostart.sh status` |
+| Claude Desktop log shows `401` | Wrong/old key in `MCP_GUARD_KEY` | Put the output of `mcp-guard gateway-key` in Claude's config (6.4) |
+| Claude Desktop log: `env: node: No such file or directory` | `PATH` missing in the config's `env` | Add it (6.4) |
+| New server not showing up | Gateway not restarted after editing `gateway.json` | `scripts/autostart.sh install`, then restart Claude |
 | Log: `PermissionError … pyvenv.cfg` | macOS blocks Desktop access | Use the runtime copy (6.2) |
+| Gateway log | — | `~/.mcp-guard/logs/gateway.log` |
 | `json.tool` error "Extra data" | extra `}` in Claude config | Remove it |
-| Claude server logs | — | `~/Library/Logs/Claude/mcp-server-<name>.log` |
+| Claude Desktop's side | — | `~/Library/Logs/Claude/mcp-server-mcp-guard.log` |
 
 ## 11. Known limitations / next steps
 
-- The desktop app isn't packaged as a `.app` yet (run with `npm run dev`).
-  Next: electron-builder packaging, and launching the daemon at login.
+- The packaged app is built for Apple Silicon only (`mac-arm64`) and is ad-hoc
+  signed, not notarized.
 - Claude Desktop shows its own "Allow once" prompt before MCP Guard's popup;
   that's Claude's feature and MCP Guard can't remove it.
 - Only **tool calls** are gated; resource reads and prompts pass through.
-- The proxy doesn't yet forward "tool list changed" notifications or the original
+- The gateway doesn't yet forward "tool list changed" notifications or the original
   server's requests back to Claude (such as sampling).
+- Tool names carry a server prefix (`filesystem__write_file`), because one gateway
+  serves several servers.
+
+### Alternative: per-server stdio proxy (no gateway)
+
+`mcp-guard proxy` still exists for Claude Desktop setups without the gateway. You
+wrap each server in Claude's config: `"command": "$MCP_GUARD_RUNTIME/bin/mcp-guard"`,
+`"args": ["proxy", "--name", "<name>", "--", <original command and args>]`. Tool
+names then have no prefix, but each server is configured separately and claude.ai
+can't use it. Don't use both for the same server, or you'll be asked twice.
